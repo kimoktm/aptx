@@ -1,0 +1,1342 @@
+#!/usr/bin/env bash
+set -e
+
+# aptx - APT package manager with isolated environments
+# Inspired by pixi but for apt packages
+
+VERSION="0.1.0"
+CONFIG_DIR="$HOME/.aptx"
+ENVIRONMENTS_DIR="$(pwd)/.aptx"
+CURRENT_ENV_FILE="$CONFIG_DIR/current_env"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check if aptx is initialized
+check_init() {
+    if [ ! -f "$CONFIG_DIR/config.json" ]; then
+        log_error "aptx not initialized. Run 'aptx init' first."
+        exit 1
+    fi
+}
+
+# Get current environment
+get_current_env() {
+    if [ -f "$CURRENT_ENV_FILE" ]; then
+        cat "$CURRENT_ENV_FILE"
+    fi
+}
+
+# Set current environment
+set_current_env() {
+    local env_name="$1"
+    echo "$env_name" > "$CURRENT_ENV_FILE"
+}
+
+# Check if environment exists
+env_exists() {
+    local env_name="$1"
+    [ -d "$ENVIRONMENTS_DIR/$env_name" ]
+}
+
+# Get environment path
+get_env_path() {
+    local env_name="$1"
+    echo "$ENVIRONMENTS_DIR/$env_name"
+}
+
+# Determine package type (base, user, or dependency)
+get_package_type() {
+    local env_path="$1"
+    local package_name="$2"
+    local aptx_toml="$env_path/aptx.toml"
+    
+    # Check if package already exists in aptx.toml
+    if [ -f "$aptx_toml" ]; then
+        if grep -q "name = \"$package_name\"" "$aptx_toml"; then
+            # Package already tracked, get its current type
+            local current_type=$(grep -A 3 "name = \"$package_name\"" "$aptx_toml" | grep 'type = ' | cut -d'"' -f2)
+            echo "$current_type"
+            return
+        fi
+    fi
+    
+    # For new packages, determine if they were manually installed
+    local is_manual=$(echo "apt-mark showmanual | grep -q '^$package_name$' && echo 'yes' || echo 'no'" | ./minimal_enter.sh "$env_path" 2>/dev/null)
+    
+    if [ "$is_manual" = "yes" ]; then
+        echo "user"
+    else
+        echo "dependency"
+    fi
+}
+
+# Track package installation
+track_package() {
+    local env_path="$1"
+    local package_name="$2"
+    local package_type="${3:-user}"  # "user" or "dependency"
+    local aptx_toml="$env_path/aptx.toml"
+    
+    # Get package info from the environment
+    local package_info=$(echo "dpkg-query -W -f='{\"name\":\"\${Package}\",\"version\":\"\${Version}\",\"depends\":\"\${Depends}\",\"recommends\":\"\${Recommends}\"}' $package_name" | ./minimal_enter.sh "$env_path" 2>/dev/null || echo "")
+    
+    if [ -n "$package_info" ]; then
+        # Parse the package info (simple JSON parsing)
+        local name=$(echo "$package_info" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+        local version=$(echo "$package_info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+        local depends=$(echo "$package_info" | grep -o '"depends":"[^"]*"' | cut -d'"' -f4)
+        
+        # Update or create aptx.toml
+        if [ -f "$aptx_toml" ]; then
+            # Add to existing file
+            if ! grep -q "name = \"$name\"" "$aptx_toml"; then
+                cat >> "$aptx_toml" <<EOF
+
+[[packages]]
+name = "$name"
+version = "$version"
+type = "$package_type"
+depends = "$depends"
+EOF
+            fi
+        else
+            # Create new aptx.toml
+            cat > "$aptx_toml" <<EOF
+# aptx environment configuration
+# Generated automatically - do not edit manually
+
+[environment]
+name = "$(basename "$env_path")"
+mode = "isolated"
+created = "$(date -Iseconds)"
+
+[[packages]]
+name = "$name"
+version = "$version"
+type = "$package_type"
+depends = "$depends"
+EOF
+        fi
+        
+        # Also track dependencies if this is a user package
+        if [ "$package_type" = "user" ]; then
+            track_dependencies "$env_path" "$package_name"
+        fi
+    fi
+}
+
+# Track dependencies of a package
+track_dependencies() {
+    local env_path="$1"
+    local package_name="$2"
+    local aptx_toml="$env_path/aptx.toml"
+    
+    # Get dependencies using apt-cache
+    local deps=$(echo "apt-cache depends $package_name | grep 'Depends:' | awk '{print \$2}'" | ./minimal_enter.sh "$env_path" 2>/dev/null || echo "")
+    
+    if [ -n "$deps" ]; then
+        while IFS= read -r dep; do
+            if [ -n "$dep" ] && [ "$dep" != "Depends:" ]; then
+                # Check if dependency is already tracked
+                if ! grep -q "name = \"$dep\"" "$aptx_toml"; then
+                    # Get dependency info using direct chroot
+                    local dep_info=$(echo "dpkg-query -W -f='{\"name\":\"\${Package}\",\"version\":\"\${Version}\",\"depends\":\"\${Depends}\"}' $dep" | sudo fakechroot chroot "$env_path" 2>/dev/null)
+                    
+                    # Validate that we got proper JSON-like output
+                    if [ -n "$dep_info" ] && echo "$dep_info" | grep -q '"name":' && echo "$dep_info" | grep -q '"version":'; then
+                        local dep_name=$(echo "$dep_info" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+                        local dep_version=$(echo "$dep_info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+                        local dep_depends=$(echo "$dep_info" | grep -o '"depends":"[^"]*"' | cut -d'"' -f4)
+                        
+                        # Only add if we have valid dependency info
+                        if [ -n "$dep_name" ] && [ -n "$dep_version" ] && [ "$dep_name" != "null" ] && [ "$dep_version" != "null" ] && [ "$dep_name" != "" ] && [ "$dep_version" != "" ]; then
+                            # Add dependency to aptx.toml
+                            cat >> "$aptx_toml" <<EOF
+
+[[packages]]
+name = "$dep_name"
+version = "$dep_version"
+type = "dependency"
+depends = "$dep_depends"
+EOF
+                        fi
+                    fi
+                fi
+            fi
+        done <<< "$deps"
+    fi
+}
+
+# Track all newly installed packages (for shell installations)
+track_new_packages() {
+    local env_path="$1"
+    local aptx_toml="$env_path/aptx.toml"
+    
+    # Get list of all currently installed packages
+    local current_packages=$(echo "dpkg-query -W -f='\${Package}\n'" | ./minimal_enter.sh "$env_path" 2>/dev/null | sort)
+    
+    # Get list of already tracked packages
+    local tracked_packages=""
+    if [ -f "$aptx_toml" ]; then
+        tracked_packages=$(grep 'name = ' "$aptx_toml" | cut -d'"' -f2 | sort)
+    fi
+    
+    # Find new packages (not yet tracked)
+    local new_packages=$(comm -23 <(echo "$current_packages") <(echo "$tracked_packages"))
+    
+    if [ -n "$new_packages" ]; then
+        log_info "Found $(echo "$new_packages" | wc -l) new packages to track..."
+        
+        # Track each new package with auto-detected type
+        while IFS= read -r package; do
+            if [ -n "$package" ]; then
+                # Determine package type
+                local package_type=$(get_package_type "$env_path" "$package")
+                track_package "$env_path" "$package" "$package_type"
+            fi
+        done <<< "$new_packages"
+        
+        log_success "Package tracking updated"
+    fi
+}
+
+# Create a tracking script that can be run inside the environment
+create_tracking_script() {
+    local env_path="$1"
+    local script_path="$env_path/usr/local/bin/aptx-track"
+    
+    cat > "$script_path" <<'EOF'
+#!/bin/bash
+# aptx-track - Track packages installed via shell
+
+set -e
+
+ENV_PATH="/"
+APTX_TOML="/aptx.toml"
+
+# Function to determine package type
+get_package_type() {
+    local package_name="$1"
+    
+    # Check if package already exists in aptx.toml
+    if [ -f "$APTX_TOML" ]; then
+        if grep -q "name = \"$package_name\"" "$APTX_TOML"; then
+            # Package already tracked, get its current type
+            local current_type=$(grep -A 3 "name = \"$package_name\"" "$APTX_TOML" | grep 'type = ' | cut -d'"' -f2)
+            echo "$current_type"
+            return
+        fi
+    fi
+    
+    # For new packages, determine if they were manually installed
+    if apt-mark showmanual | grep -q "^$package_name$"; then
+        echo "user"
+    else
+        echo "dependency"
+    fi
+}
+
+# Function to track a package
+track_package() {
+    local package_name="$1"
+    local package_type="${2:-auto}"  # "auto" means auto-detect, "user", "dependency", or "base"
+    
+    # Auto-detect package type if not specified
+    if [ "$package_type" = "auto" ]; then
+        package_type=$(get_package_type "$package_name")
+    fi
+    
+    # Get package info
+    local package_info=$(dpkg-query -W -f='{"name":"${Package}","version":"${Version}","depends":"${Depends}","recommends":"${Recommends}"}' "$package_name" 2>/dev/null || echo "")
+    
+    if [ -n "$package_info" ]; then
+        # Parse the package info
+        local name=$(echo "$package_info" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+        local version=$(echo "$package_info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+        local depends=$(echo "$package_info" | grep -o '"depends":"[^"]*"' | cut -d'"' -f4)
+        
+        # Update aptx.toml
+        if [ -f "$APTX_TOML" ]; then
+            # Check if package is already tracked
+            if ! grep -q "name = \"$name\"" "$APTX_TOML"; then
+                cat >> "$APTX_TOML" <<TOML
+
+[[packages]]
+name = "$name"
+version = "$version"
+type = "$package_type"
+depends = "$depends"
+TOML
+                echo "Tracked: $name ($version) as $package_type"
+            fi
+        fi
+    fi
+}
+
+# Function to track all new packages
+track_all_new() {
+    echo "Scanning for new packages..."
+    
+    # Get all installed packages
+    local all_packages=$(dpkg-query -W -f='${Package}\n' | sort)
+    
+    # Get tracked packages
+    local tracked_packages=""
+    if [ -f "$APTX_TOML" ]; then
+        tracked_packages=$(grep 'name = ' "$APTX_TOML" | cut -d'"' -f2 | sort)
+    fi
+    
+    # Find new packages
+    local new_packages=$(comm -23 <(echo "$all_packages") <(echo "$tracked_packages"))
+    
+    if [ -n "$new_packages" ]; then
+        echo "Found $(echo "$new_packages" | wc -l) new packages to track:"
+        while IFS= read -r package; do
+            if [ -n "$package" ]; then
+                track_package "$package" "auto"
+            fi
+        done <<< "$new_packages"
+        echo "Package tracking updated!"
+    else
+        echo "No new packages found."
+    fi
+}
+
+# Function to show package summary
+show_summary() {
+    if [ -f "$APTX_TOML" ]; then
+        local base_count=$(grep -c 'type = "base"' "$APTX_TOML" 2>/dev/null || echo "0")
+        local user_count=$(grep -c 'type = "user"' "$APTX_TOML" 2>/dev/null || echo "0")
+        local dep_count=$(grep -c 'type = "dependency"' "$APTX_TOML" 2>/dev/null || echo "0")
+        
+        # Remove any newlines and ensure we have clean numbers
+        base_count=$(echo "$base_count" | tr -d '\n')
+        user_count=$(echo "$user_count" | tr -d '\n')
+        dep_count=$(echo "$dep_count" | tr -d '\n')
+        
+        echo "Package Summary:"
+        echo "  Base packages: $base_count (from rootfs)"
+        echo "  User packages: $user_count (explicitly installed)"
+        echo "  Dependencies: $dep_count (auto-installed)"
+        echo "  Total: $((base_count + user_count + dep_count))"
+    else
+        echo "No aptx.toml found"
+    fi
+}
+
+# Main command dispatcher
+case "${1:-all}" in
+    all)
+        track_all_new
+        ;;
+    package)
+        if [ -n "$2" ]; then
+            track_package "$2" "auto"
+        else
+            echo "Usage: aptx-track package <package_name>"
+            exit 1
+        fi
+        ;;
+    summary)
+        show_summary
+        ;;
+    *)
+        echo "Usage: aptx-track [all|package <name>|summary]"
+        echo "  all              - Track all new packages"
+        echo "  package <name>   - Track specific package"
+        echo "  summary          - Show package summary"
+        exit 1
+        ;;
+esac
+EOF
+    
+    chmod +x "$script_path"
+    log_info "Created tracking script: $script_path"
+}
+
+# Create baseline package list (packages that exist from the start)
+create_baseline_packages() {
+    local env_path="$1"
+    local aptx_toml="$env_path/aptx.toml"
+    
+    # Get list of packages that exist in the fresh environment
+    local baseline_packages=$(echo "dpkg-query -W -f='\${Package}\n'" | sudo fakechroot chroot "$env_path" 2>/dev/null | sort)
+    
+    if [ -n "$baseline_packages" ]; then
+        log_info "Found $(echo "$baseline_packages" | wc -l) baseline packages"
+        
+        # Create aptx.toml with baseline packages
+        cat > "$aptx_toml" <<EOF
+# aptx environment configuration
+# Generated automatically - do not edit manually
+
+[environment]
+name = "default"
+mode = "isolated"
+created = "$(date -Iseconds)"
+
+EOF
+        
+        # Add each baseline package
+        while IFS= read -r package; do
+            if [ -n "$package" ]; then
+                # Get package info using direct chroot with better error handling
+                local package_info=$(echo "dpkg-query -W -f='{\"name\":\"\${Package}\",\"version\":\"\${Version}\",\"depends\":\"\${Depends}\"}' $package" | sudo fakechroot chroot "$env_path" 2>/dev/null)
+                
+                # Validate that we got proper JSON-like output and it contains the expected fields
+                if [ -n "$package_info" ] && echo "$package_info" | grep -q '"name":' && echo "$package_info" | grep -q '"version":'; then
+                    local name=$(echo "$package_info" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+                    local version=$(echo "$package_info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+                    local depends=$(echo "$package_info" | grep -o '"depends":"[^"]*"' | cut -d'"' -f4)
+                    
+                    # Only add if we have valid package info
+                    if [ -n "$name" ] && [ -n "$version" ] && [ "$name" != "null" ] && [ "$version" != "null" ] && [ "$name" != "" ] && [ "$version" != "" ]; then
+                        cat >> "$aptx_toml" <<EOF
+
+[[packages]]
+name = "$name"
+version = "$version"
+type = "base"
+depends = "$depends"
+EOF
+                    else
+                        echo "Skipping baseline package with invalid info: $package (name='$name', version='$version')"
+                    fi
+                else
+                    echo "Skipping baseline package with malformed info: $package (got: '$package_info')"
+                fi
+            fi
+        done <<< "$baseline_packages"
+        
+        log_success "Baseline packages recorded"
+    fi
+}
+
+# Initialize aptx and create environment
+cmd_init() {
+    local mode="${1:-isolated}"
+    
+    if [ "$mode" != "isolated" ] && [ "$mode" != "overlay" ]; then
+        log_error "Mode must be 'isolated' or 'overlay'"
+        exit 1
+    fi
+    
+    # Check if environment already exists
+    if [ -d "$ENVIRONMENTS_DIR" ] && [ "$(ls -A "$ENVIRONMENTS_DIR" 2>/dev/null)" ]; then
+        log_error "Environment already exists in current directory"
+        log_info "Use 'aptx shell' to enter existing environment"
+        exit 1
+    fi
+    
+    mkdir -p "$CONFIG_DIR" "$ENVIRONMENTS_DIR"
+    
+    # Create global config
+    cat > "$CONFIG_DIR/config.json" <<EOF
+{
+    "version": "$VERSION",
+    "default_mode": "$mode",
+    "created": "$(date -Iseconds)"
+}
+EOF
+    
+    # Create environment directly (no need for separate "new" command)
+    local env_path="$ENVIRONMENTS_DIR/default"
+    log_info "Creating environment in $mode mode..."
+    
+    # Create environment using minimal_create_rootfs.sh
+    if [ -f "./minimal_create_rootfs.sh" ]; then
+        ./minimal_create_rootfs.sh "$env_path" jammy "$mode"
+    else
+        log_error "minimal_create_rootfs.sh not found in current directory"
+        exit 1
+    fi
+    
+    # Create environment metadata
+    cat > "$env_path/.aptx_env" <<EOF
+{
+    "name": "default",
+    "mode": "$mode",
+    "created": "$(date -Iseconds)",
+    "packages": [],
+    "dependencies": []
+}
+EOF
+    
+    # Create baseline package list (packages that exist from the start)
+    log_info "Recording baseline packages..."
+    create_baseline_packages "$env_path"
+    
+    # Ensure all files are owned by current user so .aptx directory can be deleted without sudo
+    log_info "Setting file ownership for easy cleanup..."
+    if [ -n "$SUDO_USER" ]; then
+        # If run with sudo, use the original user
+        OWNER="$SUDO_USER"
+    else
+        # Otherwise use current user
+        OWNER="$USER"
+    fi
+    sudo chown -R "$OWNER:$OWNER" "$env_path" 2>/dev/null || true
+    sudo chown -R "$OWNER:$OWNER" "$ENVIRONMENTS_DIR" 2>/dev/null || true
+    
+    # Set as current environment
+    set_current_env "default"
+    
+    log_success "Environment created successfully"
+    log_info "Enter with: aptx shell"
+    log_info "Packages are automatically tracked when you install them"
+}
+
+
+
+
+
+# Deactivate environment
+cmd_deactivate() {
+    if [ -f "$CURRENT_ENV_FILE" ]; then
+        local current_env=$(get_current_env)
+        rm -f "$CURRENT_ENV_FILE"
+        log_success "Environment '$current_env' deactivated"
+    else
+        log_warning "No active environment"
+    fi
+}
+
+# Enter environment shell
+cmd_shell() {
+    local env_name="default"
+    
+    if ! env_exists "$env_name"; then
+        log_error "Environment '$env_name' does not exist"
+        log_info "Run 'aptx init' to create an environment first"
+        exit 1
+    fi
+    
+    local env_path="$(get_env_path "$env_name")"
+    
+    log_info "Entering environment '$env_name'..."
+    
+    # Enter environment using minimal_enter.sh
+    if [ -f "./minimal_enter.sh" ]; then
+        ./minimal_enter.sh "$env_path"
+    else
+        log_error "minimal_enter.sh not found in current directory"
+        exit 1
+    fi
+}
+
+# Install package(s)
+cmd_install() {
+    local packages="$*"
+    local env_name="default"
+    
+    if [ -z "$packages" ]; then
+        log_error "Package name(s) required"
+        log_info "Usage: aptx install <package1> [package2] [package3] ..."
+        exit 1
+    fi
+    
+    if ! env_exists "$env_name"; then
+        log_error "Environment '$env_name' does not exist"
+        log_info "Run 'aptx init' to create an environment first"
+        exit 1
+    fi
+    
+    local env_path="$(get_env_path "$env_name")"
+    
+    log_info "Installing packages in environment '$env_name': $packages"
+    
+    # Run apt install in the environment
+    if [ -f "./minimal_enter.sh" ]; then
+        echo "apt install -y $packages" | ./minimal_enter.sh "$env_path"
+        
+        # Track each newly installed package
+        for package in $packages; do
+            track_package "$env_path" "$package" "user"
+        done
+        
+        log_success "Packages installed successfully: $packages"
+    else
+        log_error "minimal_enter.sh not found in current directory"
+        exit 1
+    fi
+}
+
+# Run command in environment
+cmd_run() {
+    local cmd="$*"
+    
+    if [ -z "$cmd" ]; then
+        log_error "Usage: aptx run <command>"
+        exit 1
+    fi
+    
+    local env_name="default"
+    if ! env_exists "$env_name"; then
+        log_error "Environment '$env_name' does not exist"
+        log_info "Run 'aptx init' to create an environment first"
+        exit 1
+    fi
+    
+    local env_path="$(get_env_path "$env_name")"
+    
+    log_info "Running command in environment '$env_name': $cmd"
+    
+    # Run command in the environment
+    if [ -f "./minimal_enter.sh" ]; then
+        echo "$cmd" | ./minimal_enter.sh "$env_path"
+    else
+        log_error "minimal_enter.sh not found in current directory"
+        exit 1
+    fi
+}
+
+# List environments
+cmd_list() {
+    if [ ! -d "$ENVIRONMENTS_DIR" ]; then
+        log_info "No environments created yet"
+        return
+    fi
+    
+    local current_env=$(get_current_env)
+    
+    echo "Available environments:"
+    for env_dir in "$ENVIRONMENTS_DIR"/*; do
+        if [ -d "$env_dir" ]; then
+            local env_name=$(basename "$env_dir")
+            local env_file="$env_dir/.aptx_env"
+            local mode="unknown"
+            
+            if [ -f "$env_file" ]; then
+                mode=$(grep -o '"mode": "[^"]*"' "$env_file" | cut -d'"' -f4)
+            fi
+            
+            if [ "$env_name" = "$current_env" ]; then
+                echo "  * $env_name ($mode) [ACTIVE]"
+            else
+                echo "    $env_name ($mode)"
+            fi
+        fi
+    done
+}
+
+# Clean current environment and remove .aptx directory
+cmd_clean() {
+    local env_name="default"
+    
+    if ! env_exists "$env_name"; then
+        log_error "Environment '$env_name' does not exist"
+        exit 1
+    fi
+    
+    local current_env=$(get_current_env)
+    if [ "$env_name" = "$current_env" ]; then
+        log_warning "Deactivating environment '$env_name' first..."
+        cmd_deactivate
+    fi
+    
+    local env_path="$(get_env_path "$env_name")"
+    
+    log_info "Cleaning environment '$env_name' and removing .aptx directory..."
+    sudo rm -rf "$env_path"
+    sudo rm -rf "$ENVIRONMENTS_DIR"
+    
+    log_success "Environment '$env_name' and .aptx directory cleaned successfully"
+}
+
+# Show environment info and packages
+cmd_info() {
+    local env_name="default"
+    
+    if ! env_exists "$env_name"; then
+        log_error "Environment '$env_name' does not exist"
+        log_info "Run 'aptx init' to create an environment first"
+        exit 1
+    fi
+    
+    local env_path="$(get_env_path "$env_name")"
+    local aptx_toml="$env_path/aptx.toml"
+    
+    echo "Environment: $env_name"
+    echo "Path: $env_path"
+    
+    # Check if environment metadata exists
+    if [ -f "$env_path/.aptx_env" ]; then
+        local mode=$(grep -o '"mode": "[^"]*"' "$env_path/.aptx_env" | cut -d'"' -f4)
+        local created=$(grep -o '"created": "[^"]*"' "$env_path/.aptx_env" | cut -d'"' -f4)
+        echo "Mode: $mode"
+        echo "Created: $created"
+    else
+        echo "Mode: unknown"
+        echo "Created: unknown"
+    fi
+    
+    echo ""
+    
+    if [ -f "$aptx_toml" ]; then
+        # Simple package listing without complex counting
+        echo "Packages:"
+        
+        # Count user packages (explicitly installed)
+        local user_packages=$(grep -B 2 'type = "user"' "$aptx_toml" | grep 'name = ' | cut -d'"' -f2 | wc -l)
+        echo "  User-installed: $user_packages (explicitly installed)"
+        
+        if [ "$user_packages" -gt 0 ]; then
+            echo ""
+            echo "User-installed packages:"
+            grep -B 2 'type = "user"' "$aptx_toml" | grep 'name = ' | cut -d'"' -f2 | sed 's/^/  /'
+        fi
+    else
+        echo "Packages: 0 (no packages installed yet)"
+        echo ""
+        echo "No packages have been installed in this environment."
+        echo "Use 'aptx install <package>' to install packages."
+    fi
+}
+
+# Export environment to aptx.toml
+cmd_export() {
+    local env_name="default"
+    
+    if ! env_exists "$env_name"; then
+        log_error "Environment '$env_name' does not exist"
+        log_info "Run 'aptx init' to create an environment first"
+        exit 1
+    fi
+    
+    local env_path="$(get_env_path "$env_name")"
+    local aptx_toml="$env_path/aptx.toml"
+    local export_file="${env_name}_aptx.toml"
+    
+    if [ -f "$aptx_toml" ]; then
+        cp "$aptx_toml" "$export_file"
+        log_success "Environment exported to: $export_file"
+        log_info "You can share this file to recreate the environment elsewhere"
+    else
+        # Create a basic export even if no packages are installed
+        cat > "$export_file" <<EOF
+# aptx environment configuration
+# Generated automatically - do not edit manually
+
+[environment]
+name = "$env_name"
+mode = "isolated"
+created = "$(date -Iseconds)"
+exported = "$(date -Iseconds)"
+
+# No packages installed yet
+packages = []
+EOF
+        
+        log_success "Environment exported to: $export_file"
+        log_info "Environment exported (no packages installed yet)"
+    fi
+}
+
+# Global environment functions
+cmd_global_init() {
+    local global_dir="$CONFIG_DIR/global"
+    local bin_dir="$CONFIG_DIR/bin"
+    
+    if [ -d "$global_dir" ]; then
+        log_error "Global environment already exists"
+        log_info "Use 'aptx global install <package>' to install packages"
+        exit 1
+    fi
+    
+    log_info "Creating global environment..."
+    mkdir -p "$global_dir" "$bin_dir"
+    
+    # Create global environment using minimal_create_rootfs.sh (reuse existing code)
+    if [ -f "./minimal_create_rootfs.sh" ]; then
+        ./minimal_create_rootfs.sh "$global_dir" jammy overlay
+    else
+        log_error "minimal_create_rootfs.sh not found in current directory"
+        exit 1
+    fi
+    
+    # Create global environment metadata
+    cat > "$global_dir/.aptx_env" <<EOF
+{
+    "name": "global",
+    "mode": "overlay",
+    "type": "global",
+    "created": "$(date -Iseconds)",
+    "packages": [],
+    "dependencies": []
+}
+EOF
+    
+    # Create baseline package list for global environment
+    log_info "Recording baseline packages..."
+    create_baseline_packages "$global_dir"
+    
+    # Set ownership to current user
+    if [ -n "$SUDO_USER" ]; then
+        OWNER="$SUDO_USER"
+    else
+        OWNER="$USER"
+    fi
+    sudo chown -R "$OWNER:$OWNER" "$global_dir" 2>/dev/null || true
+    
+    # Add ~/.aptx/bin to PATH automatically (like pixi does)
+    log_info "Setting up automatic PATH integration..."
+    if ! grep -q "export PATH=\"\$HOME/.aptx/bin:\$PATH\"" ~/.bashrc; then
+        echo 'export PATH="$HOME/.aptx/bin:$PATH"' >> ~/.bashrc
+        log_success "Added ~/.aptx/bin to PATH in ~/.bashrc"
+        log_info "Restart your terminal or run: source ~/.bashrc"
+    else
+        log_info "~/.aptx/bin already in PATH"
+    fi
+    
+    log_success "Global environment created successfully"
+    log_info "You can now install packages globally with: aptx global install <package>"
+    log_info "Global packages will be available system-wide automatically!"
+}
+
+cmd_global_install() {
+    local packages="$*"
+    local global_dir="$CONFIG_DIR/global"
+    local bin_dir="$CONFIG_DIR/bin"
+    
+    if [ -z "$packages" ]; then
+        log_error "Package name(s) required"
+        log_info "Usage: aptx global install <package1> [package2] [package3] ..."
+        exit 1
+    fi
+    
+    if [ ! -d "$global_dir" ]; then
+        log_error "Global environment does not exist"
+        log_info "Run 'aptx global init' to create global environment first"
+        exit 1
+    fi
+    
+    log_info "Installing packages globally: $packages"
+    
+    # Use existing minimal_enter.sh to install packages (reuse existing code)
+    if [ -f "./minimal_enter.sh" ]; then
+        # Install packages and track them
+        for package in $packages; do
+            log_info "Installing $package globally..."
+            echo "apt install -y $package" | ./minimal_enter.sh "$global_dir"
+            
+            # Track the package as user-installed in global environment
+            track_package "$global_dir" "$package" "user"
+            
+            # Create binary symlinks for immediate system-wide access
+            create_global_binary_symlinks "$global_dir" "$bin_dir" "$package"
+            
+            # Create package-specific symlinks (fonts, etc.)
+            create_package_symlinks "$global_dir" "$package"
+        done
+        
+        log_success "Packages installed globally: $packages"
+        log_info "Global packages are now available system-wide automatically!"
+        log_info "No need to source any profiles - they work from anywhere!"
+    else
+        log_error "minimal_enter.sh not found in current directory"
+        exit 1
+    fi
+}
+
+cmd_global_remove() {
+    local packages="$*"
+    local global_dir="$CONFIG_DIR/global"
+    local bin_dir="$CONFIG_DIR/bin"
+    
+    if [ -z "$packages" ]; then
+        log_error "Package name(s) required"
+        log_info "Usage: aptx global remove <package1> [package2] [package3] ..."
+        exit 1
+    fi
+    
+    if [ ! -d "$global_dir" ]; then
+        log_error "Global environment does not exist"
+        exit 1
+    fi
+    
+    log_info "Removing packages globally: $packages"
+    
+    # Use existing minimal_enter.sh to remove packages (reuse existing code)
+    if [ -f "./minimal_enter.sh" ]; then
+        for package in $packages; do
+            log_info "Removing $package globally..."
+            echo "apt remove -y $package" | ./minimal_enter.sh "$global_dir"
+            
+            # Remove binary symlinks for this package
+            remove_global_binary_symlinks "$global_dir" "$bin_dir" "$package"
+            
+            # Remove package-specific symlinks
+            remove_package_symlinks "$global_dir" "$package"
+            
+            # Remove from tracking (this would need a remove_package function)
+            # For now, we'll just remove the symlink
+            sudo rm -f "/usr/local/bin/$package" 2>/dev/null || true
+        done
+        
+        log_success "Packages removed globally: $packages"
+    else
+        log_error "minimal_enter.sh not found in current directory"
+        exit 1
+    fi
+}
+
+cmd_global_list() {
+    local global_dir="$CONFIG_DIR/global"
+    
+    if [ ! -d "$global_dir" ]; then
+        log_error "Global environment does not exist"
+        log_info "Run 'aptx global init' to create global environment first"
+        exit 1
+    fi
+    
+    log_info "Global environment packages:"
+    
+    if [ -f "$global_dir/aptx.toml" ]; then
+        echo "Environment: global"
+        echo "Path: $global_dir"
+        echo "Type: global (system-wide access)"
+        echo ""
+        
+        # Simple package listing without complex counting
+        echo "Packages:"
+        
+        # List user packages (globally available)
+        local user_packages=$(grep -B 2 'type = "user"' "$global_dir/aptx.toml" | grep 'name = ' | cut -d'"' -f2 | wc -l)
+        echo "  User-installed: $user_packages (globally available)"
+        
+        if [ "$user_packages" -gt 0 ]; then
+            echo ""
+            echo "Globally available packages:"
+            grep -B 2 'type = "user"' "$global_dir/aptx.toml" | grep 'name = ' | cut -d'"' -f2 | while read package; do
+                echo "  $package"
+            done
+        fi
+    else
+        echo "No packages installed yet"
+        log_info "Install packages with: aptx global add <package>"
+    fi
+}
+
+# Generic function to create necessary symlinks for any global package
+create_package_symlinks() {
+    local global_dir="$1"
+    local package="$2"
+    
+    # Check if package has a /usr/share directory that needs to be accessible
+    if [ -d "$global_dir/usr/share/$package" ]; then
+        if [ ! -L "/usr/share/$package" ]; then
+            sudo ln -sf "$global_dir/usr/share/$package" "/usr/share/$package"
+            echo "Created symlink: /usr/share/$package -> $global_dir/usr/share/$package"
+        fi
+    fi
+    
+    # Check for other common resource directories
+    local resource_dirs=("fonts" "icons" "themes" "applications" "desktop-directories")
+    for resource_dir in "${resource_dirs[@]}"; do
+        if [ -d "$global_dir/usr/share/$resource_dir" ]; then
+            if [ ! -L "/usr/share/$resource_dir" ] && [ ! -d "/usr/share/$resource_dir" ]; then
+                sudo ln -sf "$global_dir/usr/share/$resource_dir" "/usr/share/$resource_dir"
+                echo "Created symlink: /usr/share/$resource_dir -> $global_dir/usr/share/$resource_dir"
+            fi
+        fi
+    done
+}
+
+# Create binary symlinks for global packages (pixi-like approach)
+create_global_binary_symlinks() {
+    local global_dir="$1"
+    local bin_dir="$2"
+    local package="$3"
+    
+    log_info "Creating binary symlinks for $package..."
+    
+    # Find all executable binaries in the package
+    local binary_dirs=("usr/bin" "usr/local/bin" "usr/sbin" "usr/local/sbin")
+    local symlinks_created=0
+    
+    for bin_subdir in "${binary_dirs[@]}"; do
+        if [ -d "$global_dir/$bin_subdir" ]; then
+            # Find all executable files in this directory
+            while IFS= read -r -d '' executable; do
+                if [ -x "$executable" ] && [ -f "$executable" ]; then
+                    local binary_name=$(basename "$executable")
+                    
+                    # Create symlink in ~/.aptx/bin/ (like pixi does)
+                    if [ ! -L "$bin_dir/$binary_name" ]; then
+                        ln -sf "$executable" "$bin_dir/$binary_name"
+                        log_info "Created symlink: $bin_dir/$binary_name -> $executable"
+                        symlinks_created=$((symlinks_created + 1))
+                    else
+                        log_info "Symlink already exists: $bin_dir/$binary_name"
+                    fi
+                fi
+            done < <(find "$global_dir/$bin_subdir" -type f -executable -print0 2>/dev/null)
+            
+            # Also handle symlinks (like figlet -> alternatives)
+            while IFS= read -r -d '' symlink; do
+                if [ -L "$symlink" ]; then
+                    local binary_name=$(basename "$symlink")
+                    local target=$(readlink "$symlink")
+                    
+                    # Create symlink in ~/.aptx/bin/ pointing to the target
+                    if [ ! -L "$bin_dir/$binary_name" ]; then
+                        # If target is relative, make it absolute
+                        if [[ "$target" != /* ]]; then
+                            target="$(dirname "$symlink")/$target"
+                        fi
+                        ln -sf "$target" "$bin_dir/$binary_name"
+                        log_info "Created symlink: $bin_dir/$binary_name -> $target"
+                        symlinks_created=$((symlinks_created + 1))
+                    else
+                        log_info "Symlink already exists: $bin_dir/$binary_name"
+                    fi
+                fi
+            done < <(find "$global_dir/$bin_subdir" -type l -print0 2>/dev/null)
+        fi
+    done
+    
+    if [ $symlinks_created -gt 0 ]; then
+        log_success "Created $symlinks_created binary symlinks for $package"
+        log_info "Package $package is now available system-wide!"
+    else
+        log_warning "No executable binaries found for package $package"
+    fi
+}
+
+# Remove binary symlinks for global packages
+remove_global_binary_symlinks() {
+    local global_dir="$1"
+    local bin_dir="$2"
+    local package="$3"
+    
+    log_info "Removing binary symlinks for $package..."
+    
+    # Find all executable binaries that were part of this package
+    local binary_dirs=("usr/bin" "usr/local/bin" "usr/sbin" "usr/local/sbin")
+    local symlinks_removed=0
+    
+    for bin_subdir in "${binary_dirs[@]}"; do
+        if [ -d "$global_dir/$bin_subdir" ]; then
+            # Find all executable files in this directory
+            while IFS= read -r -d '' executable; do
+                if [ -x "$executable" ] && [ -f "$executable" ]; then
+                    local binary_name=$(basename "$executable")
+                    
+                    # Remove symlink in ~/.aptx/bin/ if it exists and points to this executable
+                    if [ -L "$bin_dir/$binary_name" ]; then
+                        local target=$(readlink "$bin_dir/$binary_name")
+                        if [ "$target" = "$executable" ]; then
+                            /bin/rm -f "$bin_dir/$binary_name"
+                            log_info "Removed symlink: $bin_dir/$binary_name"
+                            symlinks_removed=$((symlinks_removed + 1))
+                        fi
+                    fi
+                fi
+            done < <(find "$global_dir/$bin_subdir" -type f -executable -print0 2>/dev/null)
+        fi
+    done
+    
+    if [ $symlinks_removed -gt 0 ]; then
+        log_success "Removed $symlinks_removed binary symlinks for $package"
+    else
+        log_info "No binary symlinks found to remove for $package"
+    fi
+}
+
+# Generic function to remove symlinks for any global package
+remove_package_symlinks() {
+    local global_dir="$1"
+    local package="$2"
+    
+    # Remove package-specific symlink if it exists
+    if [ -L "/usr/share/$package" ]; then
+        sudo rm -f "/usr/share/$package"
+        echo "Removed symlink: /usr/share/$package"
+    fi
+    
+    # Check if any resource directories were created by this package and can be safely removed
+    # (This is more complex and would need package dependency analysis)
+    echo "Package $package symlinks removed"
+}
+
+# This function is no longer needed - binary symlinks are created automatically
+# and PATH is modified automatically during global init
+
+cmd_global_clean() {
+    local global_dir="$CONFIG_DIR/global"
+    local bin_dir="$CONFIG_DIR/bin"
+    
+    if [ ! -d "$global_dir" ]; then
+        log_error "Global environment does not exist"
+        exit 1
+    fi
+    
+    log_info "Cleaning global environment..."
+    
+    # Remove all old symlinks to global packages (from previous symlink approach)
+    if [ -f "$global_dir/aptx.toml" ]; then
+        grep -B 2 'type = "user"' "$global_dir/aptx.toml" | grep 'name = ' | cut -d'"' -f2 | while read package; do
+            sudo /bin/rm -f "/usr/local/bin/$package" 2>/dev/null || true
+            echo "Removed old symlink: $package"
+        done
+    fi
+    
+    # Remove PATH modification from .bashrc FIRST (before removing directories)
+    log_info "Cleaning up PATH modification..."
+    if grep -q "export PATH=\"\$HOME/.aptx/bin:\$PATH\"" ~/.bashrc; then
+        # Remove the line that adds ~/.aptx/bin to PATH
+        /bin/sed -i '/export PATH="$HOME\/.aptx\/bin:$PATH"/d' ~/.bashrc
+        log_info "Removed ~/.aptx/bin from PATH in ~/.bashrc"
+    fi
+    
+    # Remove global environment directory (use sudo to handle permission issues)
+    sudo /bin/rm -rf "$global_dir"
+    
+    # Remove binary symlinks directory
+    if [ -d "$bin_dir" ]; then
+        /bin/rm -rf "$bin_dir"
+        log_info "Removed binary symlinks directory: $bin_dir"
+    fi
+    
+    log_success "Global environment cleaned successfully"
+    log_info "All global packages have been removed from system"
+    log_info "If you had global packages active in your shell, restart your terminal"
+}
+
+# Remove package from tracking file
+remove_package_from_tracking() {
+    local global_dir="$1"
+    local package="$2"
+    local aptx_toml="$global_dir/aptx.toml"
+    
+    if [ ! -f "$aptx_toml" ]; then
+        log_warning "No tracking file found at $aptx_toml"
+        return 0
+    fi
+    
+    log_info "Removing $package from tracking file..."
+    
+    # Create a temporary file
+    local temp_file=$(mktemp)
+    
+    # Remove the package entry from the tracking file
+    # Look for the pattern: [[package]] followed by name = "package_name" and type = "user"
+    local in_package_section=0
+    local skip_this_package=0
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[\[package\]\] ]]; then
+            # Start of a new package section
+            in_package_section=1
+            skip_this_package=0
+        elif [[ "$in_package_section" -eq 1 && "$line" =~ ^name[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+            # Check if this is the package we want to remove
+            local package_name="${BASH_REMATCH[1]}"
+            if [ "$package_name" = "$package" ]; then
+                skip_this_package=1
+                log_info "Found package $package to remove - skipping section"
+            fi
+        elif [[ "$in_package_section" -eq 1 && "$line" =~ ^\[\[ ]]; then
+            # Another section starts - end of current package section
+            in_package_section=0
+            if [ "$skip_this_package" -eq 0 ]; then
+                # Write the package section to temp file
+                echo "$line" >> "$temp_file"
+            fi
+            # Start the new section
+            in_package_section=1
+            skip_this_package=0
+        elif [[ "$in_package_section" -eq 1 && "$skip_this_package" -eq 0 ]]; then
+            # Write line to temp file if we're not skipping this package
+            echo "$line" >> "$temp_file"
+        elif [[ "$in_package_section" -eq 0 ]]; then
+            # Write non-package lines to temp file
+            echo "$line" >> "$temp_file"
+        fi
+    done < "$aptx_toml"
+    
+    # Replace the original file with the temp file
+    mv "$temp_file" "$aptx_toml"
+    
+    log_info "Removed $package from tracking file"
+}
+
+cmd_global_help() {
+    cat <<EOF
+aptx global - Manage system-wide packages
+
+USAGE:
+    aptx global <command> [options]
+
+COMMANDS:
+    init                    Initialize global environment for system-wide packages
+    install <package1> [package2]... Install package(s) globally (available system-wide)
+    remove <package1> [package2]... Remove package(s) from global environment
+    info                    Show global environment info and packages
+    clean                   Remove global environment and all global packages
+    help                    Show this help
+
+EXAMPLES:
+    aptx global init
+    aptx global install htop
+    aptx global install tree figlet
+    aptx global info
+    aptx global remove htop
+    aptx global clean
+
+    # After global install, packages work from anywhere automatically:
+    htop                    # Available from any directory
+    tree                    # Available system-wide
+    figlet "Hello World"    # Available from anywhere
+
+DESCRIPTION:
+    Global packages are installed in an isolated environment but made available
+    system-wide automatically via binary symlinks in ~/.aptx/bin/. This allows you 
+    to install packages without affecting your system, while making them accessible 
+    from anywhere on your system immediately after installation.
+
+    Similar to 'pixi global install <package>' but for the Ubuntu/APT ecosystem.
+    No manual profile sourcing required - packages work from anywhere instantly!
+EOF
+}
+
+# Show help
+cmd_help() {
+    cat <<EOF
+aptx v$VERSION - APT package manager with isolated environments
+
+USAGE:
+    aptx <command> [options]
+
+COMMANDS:
+    init [--mode=isolated|overlay]    Initialize aptx and create environment (default: isolated)
+    deactivate                        Deactivate current environment
+    shell                             Enter environment shell
+    install <package1> [package2]... Install package(s) in current environment
+    run <command>                     Run command in environment
+    info                              Show environment info and packages
+    export                            Export environment specification
+    list                              List all environments
+    clean                              Clean current environment and remove .aptx directory
+    
+    global init                       Initialize global environment for system-wide packages
+    global install <package1> [package2]... Install package(s) globally (available system-wide automatically)
+    global remove <package1> [package2]... Remove package(s) from global environment
+    global info                       Show global environment info and packages
+
+    global clean                      Remove global environment and all global packages
+    
+    help                              Show this help
+
+EXAMPLES:
+    aptx init --mode=isolated
+    aptx shell
+    aptx install gcc
+    aptx install gcc nano tree
+    aptx run apt install gcc
+    aptx info
+    aptx export
+    aptx list
+    aptx clean
+
+MODES:
+    isolated  - Completely isolated from system packages
+    overlay   - Can use system packages when not available in environment
+
+For more information, visit: https://github.com/yourusername/aptx
+EOF
+}
+
+# Main command dispatcher
+main() {
+    local cmd="$1"
+    
+    case "$cmd" in
+        init)
+            local mode="isolated"  # default mode
+            if [[ "$2" == --mode=* ]]; then
+                mode="${2#--mode=}"
+            elif [[ "$2" == --mode ]] && [[ -n "$3" ]]; then
+                mode="$3"
+            fi
+            cmd_init "$mode"
+            ;;
+
+        deactivate)
+            cmd_deactivate
+            ;;
+        shell)
+            cmd_shell
+            ;;
+        install)
+            cmd_install "${@:2}"
+            ;;
+        run)
+            cmd_run "${@:2}"
+            ;;
+        info)
+            cmd_info
+            ;;
+        export)
+            cmd_export
+            ;;
+        list)
+            cmd_list
+            ;;
+        clean)
+            cmd_clean
+            ;;
+        global)
+            local sub_cmd="$2"
+            if [ -z "$sub_cmd" ]; then
+                cmd_help
+                exit 1
+            fi
+            shift 2
+            case "$sub_cmd" in
+                init) cmd_global_init ;;
+                install) cmd_global_install "$@" ;;
+                remove) cmd_global_remove "$@" ;;
+                info) cmd_global_list ;;
+
+                clean) cmd_global_clean ;;
+                help)
+                    cmd_global_help
+                    ;;
+                *)
+                    log_error "Unknown global command: $sub_cmd"
+                    log_info "Run 'aptx global help' for usage information"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            echo "aptx v$VERSION"
+            ;;
+        "")
+            cmd_help
+            ;;
+        *)
+            log_error "Unknown command: $cmd"
+            log_info "Run 'aptx help' for usage information"
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
