@@ -37,7 +37,7 @@ aptx creates **isolated** Ubuntu environments where you can:
 aptx init
 
 # Enter and install packages
-apt install gcc make cmake
+aptx install gcc make cmake
 aptx shell
 gcc --version
 exit
